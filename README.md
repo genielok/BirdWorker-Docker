@@ -1,17 +1,46 @@
-Bird Analysis Worker (Orchestrator)This is a Python-based background orchestration service that listens to an AWS SQS queue and triggers large-scale audio analysis tasks on AWS Fargate based on uploaded manifest files (manifest.json).It serves as the core "Commander" of the entire Bird Species Analysis Pipeline.🏗 Architecture[S3 Upload] -> [S3 Event Notification] -> [SQS Queue] -> [Worker Service] -> [AWS ECS Fargate API]Listen: The Worker performs a continuous Long Polling loop on a specific SQS queue.Trigger: When manifest.json is uploaded to S3, S3 sends an event to SQS, and the Worker receives the message.Parse: The Worker downloads and parses the manifest file to get the list of audio files.Batching: It splits thousands of files into small batches (default 50 files per batch) to avoid hitting environment variable limits.Dispatch: It calls the AWS ECS run_task API to launch multiple Fargate tasks (BirdNET and Perch) in parallel.Aggregate: Once all analysis tasks are dispatched, it launches a final Aggregator task to wait for and summarize the results.📋 PrerequisitesBefore running this service, ensure the following infrastructure is ready on AWS:AWS SQS: A standard queue (e.g., BirdAnalysisQueue) configured with S3 event notifications.AWS ECS Cluster: A Fargate cluster (e.g., bird-analysis-cluster).ECS Task Definitions:birdnet-task: Task definition for running the BirdNET model.perch-task: Task definition for running the Google Perch model.aggregator-task: (Optional) Task definition for the aggregator script, usually reuses birdnet-task.Network: A Public Subnet within a VPC and a Security Group allowing outbound traffic.IAM Role: The Worker requires ecs:RunTask, iam:PassRole, sqs:ReceiveMessage, and s3:GetObject permissions.⚙️ Environment VariablesThis service is configured entirely via environment variables. Set the following variables when running the Docker container or deploying to ECS:Core ConfigurationVariableDescriptionExampleAWS_REGIONAWS Regioneu-north-1SQS_QUEUE_URLFull SQS Queue URLhttps://sqs.eu-north-1.amazonaws.com/123.../MyQueueS3_BUCKET_NAMES3 Bucket name for audio and resultsmy-birdnet-bucketECS Network Configuration (Worker must know where to launch tasks)VariableDescriptionExampleECS_CLUSTERTarget ECS Cluster Namebird-analysis-clusterSUBNET_IDSubnet ID for tasks (Public IP enabled)subnet-0a1b2c...SECURITY_GROUP_IDSecurity Group ID for taskssg-012345...Task DefinitionsVariableDescriptionDefaultTASK_DEF_BIRDNETBirdNET Task Definition Name:Versionbirdnet-task:1TASK_DEF_PERCHPerch Task Definition Name:Versionperch-task:1TASK_DEF_AGGREGATORAggregator Task Definition Name:Versionbirdnet-task:1CONTAINER_NAME_AGGREGATORContainer name inside Aggregator Taskbirdnet-worker🚀 Local Development & TestingYou can run this Worker locally in Docker to test the scheduling logic (it will connect to real AWS services).1. Build Imagedocker build -t bird-worker:local .
-2. Run ContainerCreate a .env file with the variables above, then run:docker run --env-file .env \
-  -e AWS_ACCESS_KEY_ID=xxx \
-  -e AWS_SECRET_ACCESS_KEY=xxx \
-  bird-worker:local
-(Note: Pass AWS credentials when running locally; use IAM Task Role when deploying to ECS)🚢 Deployment to AWS (Production)1. Push to ECR# Login to AWS ECR
-aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
+# 🐦 Bird Analysis Worker (Orchestrator)
 
-# Build (amd64 architecture for Fargate)
-docker build --platform linux/amd64 -t bird-worker:latest .
+The **Bird Analysis Worker** is a Python-based orchestration service that listens to an AWS SQS queue and automatically triggers large-scale audio analysis tasks on AWS Fargate whenever a `manifest.json` is uploaded.
 
-# Tag
-docker tag bird-worker:latest <ACCOUNT_ID>.dkr.ecr.<REGION>[.amazonaws.com/bird-worker:v1](https://.amazonaws.com/bird-worker:v1)
+It acts as the **Commander** of the entire Bird Species Detection & Analysis Pipeline.
 
-# Push
-docker push <ACCOUNT_ID>.dkr.ecr.<REGION>[.amazonaws.com/bird-worker:v1](https://.amazonaws.com/bird-worker:v1)
-2. Update ECS ServiceGo to the AWS ECS Console.Find the Task Definition for worker.Create a New Revision, updating the Image URI to the one pushed above (.../bird-worker:v1).Update the ECS Service (bird-worker-service), select the new revision, and check Force new deployment.📜 License[Your License Here]
+---
+
+## 📑 Table of Contents
+
+- [Overview](#-overview)
+- [Architecture](#-architecture)
+- [Prerequisites](#-prerequisites)
+- [Environment Variables](#%EF%B8%8F-environment-variables)
+- [Local Development](#-local-development--testing)
+- [Production Deployment](#-deployment-to-aws-production)
+- [License](#-license)
+
+---
+
+## 📌 Overview
+
+This service performs the following functions:
+
+- **Long-polls** an SQS queue for notifications.
+- **Detects** uploaded `manifest.json` files in S3.
+- **Parses** the manifest to extract audio file lists.
+- **Batches** thousands of files into chunks (default 50).
+- **Dispatches** BirdNET and Perch analysis tasks to AWS Fargate.
+- **Triggers** a final aggregator task to combine results.
+
+---
+
+## 🏗 Architecture
+
+### System Flow (Mermaid Diagram)
+
+```mermaid
+flowchart TD
+    A[S3 Upload audio + manifest.json] --> B[S3 Event Notification]
+    B --> C[SQS Queue]
+    C --> D[Worker Service (This Repo)]
+    D --> E[Launch Fargate Tasks<br>BirdNET / Perch]
+    E --> F[Store results in S3]
+    F --> G[Aggregator Task]
+    G --> H[Final merged reports (JSON)]
