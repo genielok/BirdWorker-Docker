@@ -5,25 +5,28 @@ import time
 import math
 import urllib.parse
 
-# --- 1. 基础配置 ---
+# --- 1. Basic Configuration ---
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL")
 AWS_REGION = os.environ.get("AWS_REGION", "eu-north-1")
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME")
 
-# --- 2. AWS 网络配置 (Fargate 必需) ---
+# --- 2. AWS Network Configuration (Required for Fargate) ---
 ECS_CLUSTER = os.environ.get("ECS_CLUSTER", "bird-analysis-cluster")
 SUBNET_ID = os.environ.get("SUBNET_ID")
 SECURITY_GROUP_ID = os.environ.get("SECURITY_GROUP_ID")
 
-# --- 3. 任务定义 (Task Definitions) ---
+# --- 3. Task Definitions ---
 TASK_DEF_BIRDNET = os.environ.get("TASK_DEF_BIRDNET", "birdnet-task:1")
 TASK_DEF_PERCH = os.environ.get("TASK_DEF_PERCH", "perch-task:1")
 TASK_DEF_AGGREGATOR = os.environ.get("TASK_DEF_AGGREGATOR", TASK_DEF_BIRDNET)
+
+CONTAINER_NAME_BIRDNET = os.environ.get("CONTAINER_NAME_BIRDNET", "birdnet-worker")
+CONTAINER_NAME_PERCH = os.environ.get("CONTAINER_NAME_PERCH", "perch-worker")
 CONTAINER_NAME_AGGREGATOR = os.environ.get(
     "CONTAINER_NAME_AGGREGATOR", "birdnet-worker"
 )
 
-# 初始化客户端
+# Initialize AWS clients
 sqs = boto3.client("sqs", region_name=AWS_REGION)
 s3 = boto3.client("s3", region_name=AWS_REGION)
 ecs = boto3.client("ecs", region_name=AWS_REGION)
@@ -33,11 +36,11 @@ def launch_analysis_task(model_type, project_name, file_batch, batch_index):
     if model_type == "perch":
         task_def = TASK_DEF_PERCH
         output_prefix = f"results/{project_name}/perch"
-        container_name = "perch-worker"
+        container_name = CONTAINER_NAME_PERCH
     else:
         task_def = TASK_DEF_BIRDNET
         output_prefix = f"results/{project_name}/birdnet"
-        container_name = "birdnet-worker"
+        container_name = CONTAINER_NAME_BIRDNET
 
     print(
         f"🚀 [Batch {batch_index}] Launching {model_type} task ({len(file_batch)} files)..."
@@ -156,7 +159,6 @@ def poll_queue():
                 for msg in response["Messages"]:
                     receipt_handle = msg["ReceiptHandle"]
                     try:
-                        # 尝试解析 JSON
                         body_str = msg["Body"]
                         body = json.loads(body_str)
 
@@ -169,22 +171,22 @@ def poll_queue():
                                     if key.endswith("manifest.json"):
                                         process_manifest(key)
 
-                        # 成功处理（或者是合法的 S3 事件但不是 manifest），删除消息
                         sqs.delete_message(
                             QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle
                         )
 
                     except json.JSONDecodeError:
-                        print(f"❌ 收到非 JSON 消息: {msg['Body']}")
-                        print("🗑️ 这是一个无效消息，正在删除以防止死循环...")
-                        # 关键：删除坏消息
+                        print(f"❌ Received non-JSON message: {msg['Body']}")
+                        print(
+                            "🗑️ Invalid message detected, deleting to avoid infinite retry loop..."
+                        )
                         sqs.delete_message(
                             QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle
                         )
 
                     except Exception as inner_e:
-                        print(f"⚠️ 处理消息逻辑出错: {inner_e}")
-                        # 这里不删除消息，让 SQS 重试 (Visibility Timeout)
+                        print(f"⚠️ Error processing message: {inner_e}")
+                        # Do NOT delete message → allow SQS retry
 
         except Exception as e:
             print(f"Polling connection error: {e}")
