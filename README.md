@@ -41,47 +41,47 @@ flowchart TD
     classDef storage fill:#3F8624,stroke:#232F3E,color:white;
     classDef aws fill:#FF9900,stroke:#232F3E,color:white;
     classDef compute fill:#326CE5,stroke:#232F3E,color:white;
-    classDef user fill:#666,stroke:#333,color:white;
 
     %% Nodes
-    User([Frontend / User])
-    S3[("S3 Bucket\n(Audio & Results)")]
-    SQS["SQS Queue\n(BirdAnalysisQueue)"]
+    S3[("S3 Bucket<br/>(Audio & Results)")]
+    SQS["SQS Queue<br/>(BirdAnalysisQueue)"]
     
     subgraph Orchestrator ["Orchestration Layer (Worker Service)"]
-        Worker["Worker\n(worker.py)"]
+        Worker["Worker<br/>(worker.py)"]
     end
     
     subgraph Compute ["Compute Layer (AWS ECS Fargate)"]
         direction TB
-        BirdNET["BirdNET Task\n(Batch Analysis)"]
-        Perch["Perch Task\n(Batch Analysis)"]
-        Aggregator["Aggregator Task\n(Final Summary)"]
+        BirdNET["BirdNET Task<br/>(Batch Analysis)"]
+        Perch["Perch Task<br/>(Batch Analysis)"]
+        Aggregator["Aggregator Task<br/>(Final Summary)"]
     end
 
     %% Flows
-    User -->|1. Upload Audio & manifest.json| S3
-    S3 -.->|2. S3 Event Notification (Put)| SQS
+    %% 1. Trigger: S3 event sends message to SQS
+    S3 -.->|1. S3 Event: PUT manifest.json| SQS
     
-    Worker -->|3. Long Polling| SQS
-    Worker -->|4. Download & Parse Manifest| S3
+    %% 2. Worker Logic
+    Worker -->|2. Long Poll| SQS
+    Worker -->|3. Download and Parse Manifest| S3
     
-    Worker == "5. Batch Dispatch" ==> BirdNET
-    Worker == "5. Batch Dispatch" ==> Perch
-    Worker -.->|6. Launch After All Batches Dispatched| Aggregator
+    Worker == "4. Batch Dispatch" ==> BirdNET
+    Worker == "4. Batch Dispatch" ==> Perch
+    Worker -.->|5. Launch Aggregator After Dispatch| Aggregator
     
-    BirdNET -->|7. Download Audio & Analyze| S3
-    Perch -->|7. Download Audio & Analyze| S3
+    %% 3. Compute Logic
+    BirdNET -->|6. Download Audio and Analyze| S3
+    Perch -->|6. Download Audio and Analyze| S3
     
-    BirdNET -->|8. Upload Result JSON| S3
-    Perch -->|8. Upload Result JSON| S3
+    BirdNET -->|7. Upload Result JSON| S3
+    Perch -->|7. Upload Result JSON| S3
     
-    Aggregator -.->|9. Poll Until All JSON Ready| S3
-    Aggregator -->|10. Merge & Upload final_report.json| S3
+    %% 4. Aggregation Logic
+    Aggregator -.->|8. Poll Until All Results Ready| S3
+    Aggregator -->|9. Merge and Upload final_report.json| S3
 
     %% Apply Styles
     class S3 storage;
     class SQS,Worker aws;
     class BirdNET,Perch,Aggregator compute;
-    class User user;
 ```
