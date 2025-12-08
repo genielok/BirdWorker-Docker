@@ -5,41 +5,35 @@ import time
 import math
 import urllib.parse
 
-# --- 1. configuration ---
+# --- 1. 基础配置 ---
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL")
-AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "eu-north-1")
-S3_BUCKET_NAME = os.environ.get("AWS_S3_BUCKET_NAME")
+AWS_REGION = os.environ.get("AWS_REGION", "eu-north-1")
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME")
 
-# --- 2. AWS network configuration (Required for Fargate) ---
-ECS_CLUSTER = os.environ.get("ECS_CLUSTER", "ReactDockerCluster")
+# --- 2. AWS 网络配置 (Fargate 必需) ---
+ECS_CLUSTER = os.environ.get("ECS_CLUSTER", "bird-analysis-cluster")
 SUBNET_ID = os.environ.get("SUBNET_ID")
 SECURITY_GROUP_ID = os.environ.get("SECURITY_GROUP_ID")
 
-# --- 3. Task Definitions ---
-# Corresponding Task Definitions created in AWS ECS
+# --- 3. 任务定义 (Task Definitions) ---
 TASK_DEF_BIRDNET = os.environ.get("TASK_DEF_BIRDNET", "birdnet-task:1")
 TASK_DEF_PERCH = os.environ.get("TASK_DEF_PERCH", "perch-task:1")
-# Aggregator Task Definition (usually reuse BirdNET or Perch container image since they include boto3)
 TASK_DEF_AGGREGATOR = os.environ.get("TASK_DEF_AGGREGATOR", TASK_DEF_BIRDNET)
+CONTAINER_NAME_AGGREGATOR = os.environ.get(
+    "CONTAINER_NAME_AGGREGATOR", "birdnet-worker"
+)
 
-# Initialize clients
+# 初始化客户端
 sqs = boto3.client("sqs", region_name=AWS_REGION)
 s3 = boto3.client("s3", region_name=AWS_REGION)
 ecs = boto3.client("ecs", region_name=AWS_REGION)
 
 
 def launch_analysis_task(model_type, project_name, file_batch, batch_index):
-    """
-    Launch a single analysis task (BirdNET or Perch)
-    """
     if model_type == "perch":
         task_def = TASK_DEF_PERCH
         output_prefix = f"results/{project_name}/perch"
-        container_name = "perch-worker"  # Must match Container Name in Task Definition
-    elif model_type == "birdnet":
-        task_def = TASK_DEF_BIRDNET
-        output_prefix = f"results/{project_name}/birdnet"
-        container_name = "birdnet-worker"
+        container_name = "perch-worker"
     else:
         task_def = TASK_DEF_BIRDNET
         output_prefix = f"results/{project_name}/birdnet"
@@ -49,7 +43,6 @@ def launch_analysis_task(model_type, project_name, file_batch, batch_index):
         f"🚀 [Batch {batch_index}] Launching {model_type} task ({len(file_batch)} files)..."
     )
 
-    # Convert file list into JSON string
     input_keys_json = json.dumps([{"key": k} for k in file_batch])
 
     try:
@@ -61,7 +54,7 @@ def launch_analysis_task(model_type, project_name, file_batch, batch_index):
                 "awsvpcConfiguration": {
                     "subnets": [SUBNET_ID],
                     "securityGroups": [SECURITY_GROUP_ID],
-                    "assignPublicIp": "ENABLED",  # Must be enabled so Fargate can pull the container image
+                    "assignPublicIp": "ENABLED",
                 }
             },
             overrides={
@@ -84,10 +77,7 @@ def launch_analysis_task(model_type, project_name, file_batch, batch_index):
 
 
 def launch_aggregator_task(project_name, total_files):
-    """
-    Launch the aggregator task (run aggregator.py)
-    """
-    print(f"👀 Launching aggregator task (monitoring {total_files} result files)...")
+    print(f"👀 Launching Aggregator Task (TaskDef: {TASK_DEF_AGGREGATOR})...")
 
     try:
         ecs.run_task(
@@ -104,9 +94,7 @@ def launch_aggregator_task(project_name, total_files):
             overrides={
                 "containerOverrides": [
                     {
-                        # Assuming BirdNET image is reused, container name = birdnet-worker
-                        "name": "birdnet-worker",
-                        # Override default command to run aggregator instead
+                        "name": CONTAINER_NAME_AGGREGATOR,
                         "command": ["python", "aggregator.py"],
                         "environment": [
                             {"name": "S3_BUCKET_NAME", "value": S3_BUCKET_NAME},
@@ -118,16 +106,15 @@ def launch_aggregator_task(project_name, total_files):
                 ]
             },
         )
-        print("✅ Aggregator started!")
+        print("✅ Aggregator launched!")
     except Exception as e:
-        print(f"💥 Failed to start aggregator: {e}")
+        print(f"💥 Failed to launch Aggregator: {e}")
 
 
 def process_manifest(manifest_key):
-    print(f"📄 Processing manifest file: {manifest_key}")
+    print(f"📄 Processing manifest: {manifest_key}")
 
     try:
-        # 1. Download and parse manifest
         obj = s3.get_object(Bucket=S3_BUCKET_NAME, Key=manifest_key)
         manifest = json.loads(obj["Body"].read())
 
@@ -139,66 +126,82 @@ def process_manifest(manifest_key):
             print("⚠️ Empty manifest, skipping.")
             return
 
-        print(f"📊 Project: {project_name} | Total files: {total_files}")
+        print(f"📊 Project: {project_name} | Total Files: {total_files}")
 
-        # 2. Split file list into batches (to avoid overly long env variables)
         BATCH_SIZE = 50
         total_batches = math.ceil(total_files / BATCH_SIZE)
 
-        # 3. Launch analysis tasks for all batches
         for i in range(total_batches):
             start = i * BATCH_SIZE
             end = start + BATCH_SIZE
             batch_files = all_files[start:end]
 
-            # Launch both models in parallel
             launch_analysis_task("birdnet", project_name, batch_files, i + 1)
             launch_analysis_task("perch", project_name, batch_files, i + 1)
 
-        # 4. Finally, launch aggregator
         launch_aggregator_task(project_name, total_files)
 
     except Exception as e:
-        print(f"❌ Manifest processing failed: {e}")
+        print(f"❌ Processing failed: {e}")
 
 
 def poll_queue():
-    print(f"Worker listening on queue: {SQS_QUEUE_URL}")
+    print(f"Worker listening on: {SQS_QUEUE_URL}")
     while True:
         try:
-            # Long polling SQS
             response = sqs.receive_message(
                 QueueUrl=SQS_QUEUE_URL, MaxNumberOfMessages=1, WaitTimeSeconds=20
             )
-
             if "Messages" in response:
                 for msg in response["Messages"]:
-                    body = json.loads(msg["Body"])
+                    receipt_handle = msg["ReceiptHandle"]
+                    try:
+                        # 尝试解析 JSON
+                        body_str = msg["Body"]
+                        body = json.loads(body_str)
 
-                    # S3 event notifications may contain multiple records
-                    if "Records" in body:
-                        for record in body["Records"]:
-                            # Decode URL-encoded S3 key
-                            key = urllib.parse.unquote_plus(
-                                record["s3"]["object"]["key"]
-                            )
+                        if "Records" in body:
+                            for record in body["Records"]:
+                                if "s3" in record:
+                                    key = urllib.parse.unquote_plus(
+                                        record["s3"]["object"]["key"]
+                                    )
+                                    if key.endswith("manifest.json"):
+                                        process_manifest(key)
 
-                            # Only handle manifest.json files
-                            if key.endswith("manifest.json"):
-                                process_manifest(key)
+                        # 成功处理（或者是合法的 S3 事件但不是 manifest），删除消息
+                        sqs.delete_message(
+                            QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle
+                        )
 
-                    # Delete message to avoid reprocessing
-                    sqs.delete_message(
-                        QueueUrl=SQS_QUEUE_URL, ReceiptHandle=msg["ReceiptHandle"]
-                    )
+                    except json.JSONDecodeError:
+                        print(f"❌ 收到非 JSON 消息: {msg['Body']}")
+                        print("🗑️ 这是一个无效消息，正在删除以防止死循环...")
+                        # 关键：删除坏消息
+                        sqs.delete_message(
+                            QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle
+                        )
+
+                    except Exception as inner_e:
+                        print(f"⚠️ 处理消息逻辑出错: {inner_e}")
+                        # 这里不删除消息，让 SQS 重试 (Visibility Timeout)
+
         except Exception as e:
-            print(f"Polling error: {e}")
+            print(f"Polling connection error: {e}")
             time.sleep(5)
 
 
 if __name__ == "__main__":
-    # Simple startup check
+    missing_vars = []
     if not SQS_QUEUE_URL:
-        print("❌ Error: SQS_QUEUE_URL environment variable not set")
+        missing_vars.append("SQS_QUEUE_URL")
+    if not SUBNET_ID:
+        missing_vars.append("SUBNET_ID")
+    if not S3_BUCKET_NAME:
+        missing_vars.append("S3_BUCKET_NAME")
+
+    if missing_vars:
+        print(f"❌ Fatal: Missing environment variables: {', '.join(missing_vars)}")
+        exit(1)
     else:
         poll_queue()
