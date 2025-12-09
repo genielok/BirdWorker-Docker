@@ -4,7 +4,7 @@ import soundfile as sf
 import tensorflow as tf
 from datetime import datetime
 
-THRESHOLD = 0.5
+THRESHOLD = 0.7
 
 
 class PerchAnalyzer:

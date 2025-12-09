@@ -3,7 +3,7 @@ from datetime import datetime
 from birdnetlib import Recording
 from birdnetlib.analyzer import Analyzer
 
-THRESHOLD = 0.5
+THRESHOLD = 0.7
 
 
 class BirdNetAnalyzer:

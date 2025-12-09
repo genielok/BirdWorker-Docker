@@ -3,14 +3,15 @@ import sys
 import json
 import boto3
 import warnings
+import traceback
 
 from datetime import datetime
 from models import load_model  # Unified model loader
 
-print("--- RUNNING VERSION: unified-model-runner ---")
+print("--- RUNNING VERSION: unified-model-runner (with Skip Logic) ---")
 
 # -----------------------------------------------------------------
-# 1. Configuration (from environment variables)
+# 1. Configuration
 # -----------------------------------------------------------------
 INPUT_BUCKET = os.environ.get("S3_BUCKET_NAME")
 OUTPUT_PREFIX = os.environ.get("S3_OUTPUT_PREFIX", "results/birdnet")
@@ -33,9 +34,13 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 s3 = boto3.client("s3")
 
-# Load correct model
-model = load_model(MODEL_NAME)
-print(f"MODEL LOADED: {MODEL_NAME}")
+# Load model globally
+try:
+    model = load_model(MODEL_NAME)
+    print(f"MODEL LOADED: {MODEL_NAME}")
+except Exception as e:
+    print(f"FATAL: Failed to load model: {e}")
+    sys.exit(1)
 
 
 # -----------------------------------------------------------------
@@ -44,10 +49,21 @@ print(f"MODEL LOADED: {MODEL_NAME}")
 def process_single_file(key: str):
     local_filename = os.path.basename(key)
     local_audio_path = os.path.join(TEMP_DIR, local_filename)
+
+    # 构造结果文件的 S3 路径
+    result_key = f"{OUTPUT_PREFIX}/{local_filename}.json"
     local_result_path = os.path.join(TEMP_DIR, f"{local_filename}.json")
 
+    # ‼️ 1. Idempotency Check) ‼️
     try:
-        print(f"Downloading s3://{INPUT_BUCKET}/{key}")
+        s3.head_object(Bucket=INPUT_BUCKET, Key=result_key)
+        print(f"⏩ [Skip] Result already exists: {result_key}")
+        return result_key
+    except Exception:
+        pass
+
+    try:
+        print(f"⬇️ Downloading s3://{INPUT_BUCKET}/{key}")
         s3.download_file(INPUT_BUCKET, key, local_audio_path)
 
         if os.path.getsize(local_audio_path) < 1024:
@@ -65,30 +81,40 @@ def process_single_file(key: str):
             "source_bucket": INPUT_BUCKET,
             "source_key": key,
             "analysis_model": MODEL_NAME,
-            "total_detections": detections,
+            "status": "success",
             "detections": detections,
+            "processed_at": datetime.now().isoformat(),
         }
 
+    except Exception as e:
+        print(f"❌ Processing failed for {key}: {e}")
+        result_json = {
+            "source_bucket": INPUT_BUCKET,
+            "source_key": key,
+            "analysis_model": MODEL_NAME,
+            "status": "error",
+            "error_message": str(e),
+            "detections": [],
+        }
+
+    try:
         with open(local_result_path, "w") as f:
             json.dump(result_json, f, indent=2)
 
-        result_key = f"{OUTPUT_PREFIX}/{local_filename}.json"
         s3.upload_file(local_result_path, INPUT_BUCKET, result_key)
-        print(f"Uploaded result → s3://{INPUT_BUCKET}/{result_key}")
-
+        print(f"⬆️ Uploaded result (status={result_json.get('status')}) → {result_key}")
         return result_key
 
-    except Exception as e:
-        print(f"Processing failed for {key}: {e}")
-        import traceback
-
-        traceback.print_exc()
+    except Exception as upload_error:
+        print(f"💥 Fatal: Upload failed for {key}: {upload_error}")
         return None
 
     finally:
-        for p in [local_audio_path, local_result_path]:
-            if os.path.exists(p):
-                os.remove(p)
+        # 清理临时文件
+        if os.path.exists(local_audio_path):
+            os.remove(local_audio_path)
+        if os.path.exists(local_result_path):
+            os.remove(local_result_path)
 
 
 # -----------------------------------------------------------------
