@@ -3,3 +3,5 @@ soundfile
 numpy<=1.24.3
 boto3
 pandas
+librosa
+scipy

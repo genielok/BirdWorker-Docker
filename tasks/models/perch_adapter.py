@@ -3,22 +3,22 @@ import pandas as pd
 import soundfile as sf
 import tensorflow as tf
 from datetime import datetime
+import librosa
+import scipy.signal
 
 THRESHOLD = 0.7
+SAMPLE_RATE = 32000
 
 
 class PerchAnalyzer:
     def __init__(self, model_dir, label_path, taxonomy_path):
         """
         initialize Perch model analyzer
-        :param model_dir: SavedModel folder path
-        :param label_path: label.csv file path (for id -> eBird code)
-        :param taxonomy_path: eBird_taxonomy_v2025.csv file path (for eBird code -> names)
         """
         print(f"Loading model from {model_dir}...")
         self.model = tf.saved_model.load(model_dir)
         self.infer_fn = self.model.infer_tf
-        self.target_sr = 32000
+        self.target_sr = SAMPLE_RATE
         self.window_seconds = 5.0
         self.window_samples = int(self.window_seconds * self.target_sr)
 
@@ -29,81 +29,122 @@ class PerchAnalyzer:
         df_labels = pd.read_csv(label_path)
         self.id_to_code = df_labels["ebird2021"].to_dict()
 
-        # 2.load taxonomy
         df_tax = pd.read_csv(taxonomy_path)
-        # build code_to_meta  key=SPECIES_CODE, value={SCI_NAME, PRIMARY_COM_NAME}
         self.code_to_meta = df_tax.set_index("SPECIES_CODE")[
             ["SCI_NAME", "PRIMARY_COM_NAME"]
         ].to_dict("index")
 
     def _load_and_resample(self, audio_path: str) -> np.ndarray:
-        audio, sr = sf.read(audio_path, dtype="float32")
-        if audio.ndim > 1:
-            audio = np.mean(audio, axis=1)
-        if sr != self.target_sr:
-            duration = audio.shape[0] / sr
-            target_len = int(duration * self.target_sr)
-            x_old = np.linspace(0, 1, num=audio.shape[0], endpoint=False)
-            x_new = np.linspace(0, 1, num=target_len, endpoint=False)
-            audio = np.interp(x_new, x_old, audio).astype("float32")
-        return audio
+        try:
+            audio, _ = librosa.load(audio_path, sr=self.target_sr, mono=True)
+        except Exception as e:
+            print(f"Error loading audio with librosa: {e}")
+            return np.array([], dtype="float32")
+        return audio.astype("float32")
 
-    def _make_windows(self, waveform: np.ndarray) -> np.ndarray:
+    def _high_pass_filter(self, audio: np.ndarray, cutoff=200) -> np.ndarray:
+        if len(audio) == 0:
+            return audio
+        sos = scipy.signal.butter(10, cutoff, "hp", fs=self.target_sr, output="sos")
+        filtered = scipy.signal.sosfilt(sos, audio)
+        return filtered.astype("float32")
+
+    def _make_windows(self, waveform: np.ndarray, overlap=0.5) -> (np.ndarray, list):
         total_samples = waveform.shape[0]
-        if total_samples <= self.window_samples:
+        step = int(self.window_samples * (1 - overlap))
+
+        windows = []
+        timestamps = []
+
+        if total_samples < self.window_samples:
             padded = np.zeros(self.window_samples, dtype="float32")
             padded[:total_samples] = waveform
-            return padded[None, :]
-        num_windows = int(np.ceil(total_samples / self.window_samples))
-        windows = np.zeros((num_windows, self.window_samples), dtype="float32")
-        for i in range(num_windows):
-            start = i * self.window_samples
-            end = min(start + self.window_samples, total_samples)
-            chunk = waveform[start:end]
-            windows[i, : chunk.shape[0]] = chunk
-        return windows
+            return np.array([padded]), [0.0]
+
+        for start in range(0, total_samples - self.window_samples + 1, step):
+            end = start + self.window_samples
+            windows.append(waveform[start:end])
+            timestamps.append(start / self.target_sr)
+
+        return np.array(windows, dtype="float32"), timestamps
+
+    def _suppress_duplicates(self, detections, time_gap_threshold=3.0):
+        if not detections:
+            return []
+
+        detections.sort(key=lambda x: x["confidence"], reverse=True)
+        final_detections = []
+
+        while detections:
+            best = detections.pop(0)
+            final_detections.append(best)
+
+            # filter out duplicates, if audio events are too close in time, only keep the best one
+            detections = [
+                d
+                for d in detections
+                if not (
+                    d["label"] == best["label"]
+                    and abs(d["start_time"] - best["start_time"]) < time_gap_threshold
+                )
+            ]
+
+        return sorted(final_detections, key=lambda x: x["start_time"])
 
     def analyze(self, audio_path: str, date: datetime, threshold: float = THRESHOLD):
         """
-        Analyze an audio file and return detections above the confidence threshold.
-        :param audio_path: audio file path
-        :param threshold:  (0.0 - 1.0)
+        Enhanced analysis pipeline
         """
+        # 1. Load & Resample
         waveform = self._load_and_resample(audio_path)
-        windows = self._make_windows(waveform)
-        tf_windows = tf.convert_to_tensor(windows, dtype=tf.float32)
+        if len(waveform) == 0:
+            return []
 
+        # 2. Noise Suppression (High Pass)
+        waveform = self._high_pass_filter(waveform)
+
+        # 3. Create Overlapping Windows
+        # overlap=0.5 means each 2.5s will appear in two 5s
+        windows, timestamps = self._make_windows(waveform, overlap=0.5)
+
+        # Batch inference
+        tf_windows = tf.convert_to_tensor(windows, dtype=tf.float32)
         outputs = self.infer_fn(tf_windows)
 
-        # get Logits and convert to probabilities
-        label_logits = outputs["label"].numpy()
-        probabilities = tf.nn.softmax(label_logits, axis=-1).numpy()
+        label_logits = outputs["label"]  # Keep as tensor for sigmoid
 
-        results = []
+        probabilities = tf.math.sigmoid(label_logits).numpy()
 
-        # iterate over each window
+        # reduce noise by smoothing over time
+        probabilities = scipy.ndimage.uniform_filter1d(
+            probabilities, size=3, axis=0, mode="nearest"
+        )
+
+        raw_detections = []
         num_windows = probabilities.shape[0]
-        for window_idx in range(num_windows):
-            # find classes with prob > threshold
-            high_prob_indices = np.where(probabilities[window_idx] > threshold)[0]
+
+        for i in range(num_windows):
+            high_prob_indices = np.where(probabilities[i] > threshold)[0]
+
+            start_time = timestamps[i]
 
             for class_id in high_prob_indices:
-                confidence = float(probabilities[window_idx][class_id])
-
+                confidence = float(probabilities[i][class_id])
                 code = self.id_to_code.get(class_id, "Unknown_Code")
                 meta = self.code_to_meta.get(code, {})
 
                 detection = {
                     "confidence": confidence,
-                    "label": code,  # ebird code
+                    "label": code,
                     "scientific_name": meta.get("SCI_NAME", "Unknown"),
                     "common_name": meta.get("PRIMARY_COM_NAME", "Unknown"),
-                    "start_time": window_idx * self.window_seconds,
-                    "end_time": (window_idx + 1) * self.window_seconds,
+                    "start_time": start_time,
+                    "end_time": start_time + self.window_seconds,
+                    "date": date.isoformat(),  # 记录日期
                 }
-                results.append(detection)
+                raw_detections.append(detection)
 
-        # sort by confidence descending
-        results.sort(key=lambda x: x["confidence"], reverse=True)
+        # (NMS) remove duplicates
+        clean_results = self._suppress_duplicates(raw_detections)
 
-        return results
+        return clean_results

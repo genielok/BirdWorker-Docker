@@ -3,7 +3,7 @@ import sys
 import json
 import boto3
 import warnings
-import traceback
+import re
 
 from datetime import datetime
 from models import load_model  # Unified model loader
@@ -19,6 +19,12 @@ PROJECT_NAME = os.environ.get("PROJECT_NAME", "unknown")
 MODEL_NAME = os.environ.get("MODEL_NAME", "birdnet")
 
 INPUT_KEYS_JSON = os.environ.get("S3_INPUT_KEYS")
+if PROJECT_NAME:
+    MANIFEST_KEY = f"public/raw_uploads/{PROJECT_NAME}/manifest.json"
+else:
+    MANIFEST_KEY = None
+    print("⚠️ No PROJECT_NAME found, Manifest loading will be skipped.")
+
 if not INPUT_BUCKET or not INPUT_KEYS_JSON:
     print("FATAL: S3_BUCKET_NAME and S3_INPUT_KEYS must be set.")
     sys.exit(1)
@@ -33,6 +39,45 @@ TEMP_DIR = "/tmp/audio_work"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 s3 = boto3.client("s3")
+
+
+def load_project_metadata(bucket, manifest_key):
+    """
+    read manifest.json from S3 to get project-level metadata like lat/lon
+    """
+    default_meta = {
+        "lat": float(os.environ.get("DEFAULT_LAT", "20.45")),
+        "lon": float(
+            os.environ.get("DEFAULT_LON", "43.35")
+        ),  # default: Minas Gerais, Brazil
+    }
+
+    if not manifest_key:
+        print("⚠️ No Manifest Key provided. Using env defaults.")
+        return default_meta
+
+    print(f"📄 Loading Project Metadata from s3://{bucket}/{manifest_key}")
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=manifest_key)
+        data = json.loads(obj["Body"].read().decode("utf-8"))
+
+        info = data.get("deployment_info", {})
+
+        if "latitude" in info and "longitude" in info:
+            print(
+                f"✅ Found Deployment Location: {info['latitude']}, {info['longitude']}"
+            )
+            return {"lat": float(info["latitude"]), "lon": float(info["longitude"])}
+        else:
+            print("⚠️ 'deployment_info' missing in manifest. Using defaults.")
+            return default_meta
+
+    except Exception as e:
+        print(f"⚠️ Failed to load manifest json: {e}")
+        return default_meta
+
+
+PROJECT_METADATA = load_project_metadata(INPUT_BUCKET, MANIFEST_KEY)
 
 # Load model globally
 try:
@@ -50,7 +95,6 @@ def process_single_file(key: str):
     local_filename = os.path.basename(key)
     local_audio_path = os.path.join(TEMP_DIR, local_filename)
 
-    # 构造结果文件的 S3 路径
     result_key = f"{OUTPUT_PREFIX}/{local_filename}.json"
     local_result_path = os.path.join(TEMP_DIR, f"{local_filename}.json")
 
@@ -69,9 +113,29 @@ def process_single_file(key: str):
         if os.path.getsize(local_audio_path) < 1024:
             raise ValueError("File too small or corrupted (<1KB).")
 
+        local_filename = os.path.basename(key)
+
+        file_dt = datetime.now()
+        match = re.search(r"_(\d{8})_(\d{6})", local_filename)
+        if match:
+            try:
+                # file name: 20250627_211900
+                dt_str = f"{match.group(1)}_{match.group(2)}"
+                file_dt = datetime.strptime(dt_str, "%Y%m%d_%H%M%S")
+            except ValueError:
+                print(f"⚠️ Date parse error for {local_filename}, using NOW.")
+
+        lat = PROJECT_METADATA["lat"]
+        lon = PROJECT_METADATA["lon"]
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            detections = model.analyze(local_audio_path, datetime.now())
+            if MODEL_NAME.lower() == "birdnet":
+                detections = model.analyze(
+                    audio_path=local_audio_path, date=file_dt, lat=lat, lon=lon
+                )
+            else:
+                detections = model.analyze(audio_path=local_audio_path, date=file_dt)
 
             for det in detections:
                 det["source_s3_key"] = key
@@ -110,7 +174,6 @@ def process_single_file(key: str):
         return None
 
     finally:
-        # 清理临时文件
         if os.path.exists(local_audio_path):
             os.remove(local_audio_path)
         if os.path.exists(local_result_path):
