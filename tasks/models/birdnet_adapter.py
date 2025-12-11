@@ -3,7 +3,8 @@ from datetime import datetime
 from birdnetlib import Recording
 from birdnetlib.analyzer import Analyzer
 
-THRESHOLD = 0.6
+THRESHOLD = 0.5
+OVERLAP = 0.5
 
 
 class BirdNetAnalyzer:
@@ -16,11 +17,11 @@ class BirdNetAnalyzer:
         recording = Recording(
             analyzer=self.analyzer,
             path=audio_path,
-            date=date,
+            date=None,
             lat=lat,
             lon=lon,
             min_conf=self.min_conf,
-            overlap=0.5,
+            overlap=OVERLAP,
         )
 
         try:

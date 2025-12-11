@@ -5,9 +5,11 @@ import tensorflow as tf
 from datetime import datetime
 import librosa
 import scipy.signal
+import scipy.ndimage
 
-THRESHOLD = 0.7
+THRESHOLD = 0.6
 SAMPLE_RATE = 32000
+OVERLAP = 0.0
 
 
 class PerchAnalyzer:
@@ -36,7 +38,9 @@ class PerchAnalyzer:
 
     def _load_and_resample(self, audio_path: str) -> np.ndarray:
         try:
-            audio, _ = librosa.load(audio_path, sr=self.target_sr, mono=True)
+            audio, _ = librosa.load(
+                audio_path, sr=self.target_sr, mono=True, res_type="linear"
+            )
         except Exception as e:
             print(f"Error loading audio with librosa: {e}")
             return np.array([], dtype="float32")
@@ -49,7 +53,9 @@ class PerchAnalyzer:
         filtered = scipy.signal.sosfilt(sos, audio)
         return filtered.astype("float32")
 
-    def _make_windows(self, waveform: np.ndarray, overlap=0.5) -> (np.ndarray, list):
+    def _make_windows(
+        self, waveform: np.ndarray, overlap=OVERLAP
+    ) -> (np.ndarray, list):
         total_samples = waveform.shape[0]
         step = int(self.window_samples * (1 - overlap))
 
@@ -105,7 +111,7 @@ class PerchAnalyzer:
 
         # 3. Create Overlapping Windows
         # overlap=0.5 means each 2.5s will appear in two 5s
-        windows, timestamps = self._make_windows(waveform, overlap=0.5)
+        windows, timestamps = self._make_windows(waveform, overlap=OVERLAP)
 
         # Batch inference
         tf_windows = tf.convert_to_tensor(windows, dtype=tf.float32)
