@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 python:3.9-slim
+FROM --platform=linux/amd64 python:3.10-slim
 
 RUN apt-get update && apt-get install -y \
     libsndfile1 \
@@ -9,13 +9,12 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY requirements-birdnet.txt ./requirements.txt
-
-COPY run_model.py aggregator.py ./
-
-COPY models/audio_utils.py models/birdnet_adapter.py models/__init__.py  ./models/
-
+COPY aggregator.py .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
+ENV PYTHONPATH="/app/models:${PYTHONPATH}"
+
+COPY . .
 
 CMD ["python", "run_model.py"]
