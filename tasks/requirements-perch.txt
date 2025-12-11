@@ -5,5 +5,4 @@ boto3
 pandas
 librosa
 scipy
-resampy
-samplerate
+soxr

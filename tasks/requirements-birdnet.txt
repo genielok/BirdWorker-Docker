@@ -5,3 +5,4 @@ tflite-runtime
 boto3
 numpy<2.0
 soundfile
+scipy

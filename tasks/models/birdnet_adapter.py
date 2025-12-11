@@ -1,53 +1,71 @@
-import uuid
+import os
 from datetime import datetime
+from typing import List, Dict, Any
 from birdnetlib import Recording
 from birdnetlib.analyzer import Analyzer
-
-THRESHOLD = 0.5
-OVERLAP = 0.5
+from audio_utils import AudioPreprocessor
 
 
 class BirdNetAnalyzer:
-    def __init__(self, min_conf=THRESHOLD):
-        self.min_conf = min_conf
+    def __init__(self):
         self.analyzer = Analyzer()
-        print(f"Loaded BirdNET (version {self.analyzer.version})")
+        self.preprocessor = AudioPreprocessor(target_sr=48000)
 
-    def analyze(self, audio_path: str, date: datetime, lat=None, lon=None):
-        recording = Recording(
-            analyzer=self.analyzer,
-            path=audio_path,
-            date=None,
-            lat=lat,
-            lon=lon,
-            min_conf=self.min_conf,
-            overlap=OVERLAP,
-        )
+    def analyze(
+        self,
+        audio_path: str,
+        min_conf: float = 0.1,
+        lat: float = None,
+        lon: float = None,
+        date: datetime = None,
+        cleanup: bool = True,
+    ) -> List[Dict[str, Any]]:
 
+        temp_path = None
         try:
+            temp_path = self.preprocessor.create_denoised_temp_file(audio_path)
+            if not temp_path:
+                print("❌ Failed to create temp file.")
+                return []
+
+            recording = Recording(
+                analyzer=self.analyzer,
+                path=audio_path,
+                lat=lat,
+                lon=lon,
+                date=date or datetime.now(),
+                min_conf=min_conf,
+            )
+
             recording.analyze()
+
+            detections = []
+            for det in recording.detections:
+                if det["confidence"] < min_conf:
+                    continue
+
+                detections.append(
+                    {
+                        "common_name": det["common_name"],
+                        "scientific_name": det["scientific_name"],
+                        "confidence": det["confidence"],
+                        "start_time": det["start_time"],
+                        "end_time": det["end_time"],
+                        "label": det["label"],
+                    }
+                )
+
+            detections.sort(key=lambda x: x["confidence"], reverse=True)
+            return detections
+
         except Exception as e:
-            print(f"BirdNET analysis failed: {e}")
+            print(f"❌ Analysis error: {e}")
             return []
 
-        detections = []
-        for det in recording.detections:
-            normalized_det = {
-                "id": str(uuid.uuid4()),
-                "model": "BirdNET",
-                "model_version": self.analyzer.version,
-                "confidence": det.get("confidence"),
-                "label": det.get(
-                    "label"
-                ),  # 注意：BirdNET返回的是 "Common Name_Scientific Name" 这种格式，可能需要拆分
-                "scientific_name": det.get("scientific_name"),
-                "common_name": det.get("common_name"),
-                "start_time": det.get("start_time"),
-                "end_time": det.get("end_time"),
-                "date": date.isoformat(),
-            }
-            detections.append(normalized_det)
-
-        detections.sort(key=lambda x: x["confidence"], reverse=True)
-
-        return detections
+        finally:
+            if cleanup and temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                    print(f"🧹 Temporary file removed: {temp_path}")
+                except OSError:
+                    pass

@@ -9,10 +9,12 @@ WORKDIR /app
 
 COPY requirements-perch.txt ./requirements.txt
 
-COPY models/perch_model ./perch_model
+COPY run_model.py ./
+
+COPY models/audio_utils.py models/perch_adapter.py ./models/
+
+COPY models/perch_model ./models/perch_model
 
 RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
 
 ENTRYPOINT ["python", "run_model.py"]

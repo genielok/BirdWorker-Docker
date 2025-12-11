@@ -9,10 +9,13 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY requirements-birdnet.txt ./requirements.txt
-COPY aggregator.py .
+
+COPY run_model.py aggregator.py ./
+
+COPY models/audio_utils.py models/birdnet_adapter.py models/__init__.py  ./models/
+
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
 
 CMD ["python", "run_model.py"]

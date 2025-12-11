@@ -39,6 +39,7 @@ TEMP_DIR = "/tmp/audio_work"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 s3 = boto3.client("s3")
+MIN_CONF = 0.4  # threashold
 
 
 def load_project_metadata(bucket, manifest_key):
@@ -132,10 +133,18 @@ def process_single_file(key: str):
             warnings.simplefilter("ignore")
             if MODEL_NAME.lower() == "birdnet":
                 detections = model.analyze(
-                    audio_path=local_audio_path, date=file_dt, lat=lat, lon=lon
+                    audio_path=local_audio_path,
+                    min_conf=MIN_CONF,
+                    lat=lat,
+                    lon=lon,
+                    date=file_dt,
                 )
             else:
-                detections = model.analyze(audio_path=local_audio_path, date=file_dt)
+                detections = model.analyze(
+                    audio_path=local_audio_path,
+                    min_conf=MIN_CONF,
+                    date=file_dt,
+                )
 
             for det in detections:
                 det["source_s3_key"] = key

@@ -1,156 +1,149 @@
 import numpy as np
 import pandas as pd
-import soundfile as sf
 import tensorflow as tf
-from datetime import datetime
-import librosa
-import scipy.signal
 import scipy.ndimage
-
-THRESHOLD = 0.6
-SAMPLE_RATE = 32000
-OVERLAP = 0.0
+from datetime import datetime
+from audio_utils import AudioPreprocessor
 
 
 class PerchAnalyzer:
-    def __init__(self, model_dir, label_path, taxonomy_path):
-        """
-        initialize Perch model analyzer
-        """
-        print(f"Loading model from {model_dir}...")
-        self.model = tf.saved_model.load(model_dir)
-        self.infer_fn = self.model.infer_tf
-        self.target_sr = SAMPLE_RATE
-        self.window_seconds = 5.0
-        self.window_samples = int(self.window_seconds * self.target_sr)
+    """
+    Perch Adapter.
+    Uses external AudioPreprocessor for consistency.
+    """
 
-        print("Loading taxonomy maps...")
+    def __init__(self, model_dir, label_path, taxonomy_path):
+        print(f"Loading Perch model from {model_dir}...")
+
+        # Load model
+        self.model = tf.saved_model.load(model_dir)
+        if "serving_default" in self.model.signatures:
+            self.infer_fn = self.model.signatures["serving_default"]
+        else:
+            self.infer_fn = self.model.infer_tf
+
+        # Load label maps
         self._load_label_maps(label_path, taxonomy_path)
 
+        # Initialize your custom preprocessor (Targeting 32k for Perch)
+        self.processor = AudioPreprocessor(target_sr=32000)
+        self.window_seconds = 5.0
+
     def _load_label_maps(self, label_path, taxonomy_path):
+        # Load label.csv (Model Output ID -> eBird Code)
         df_labels = pd.read_csv(label_path)
-        self.id_to_code = df_labels["ebird2021"].to_dict()
+        if "ebird2021" in df_labels.columns:
+            self.id_to_code = df_labels["ebird2021"].to_dict()
+        else:
+            # Assume first column is ID, second is Code
+            self.id_to_code = df_labels.iloc[:, 1].to_dict()
 
+        # Load taxonomy.csv (eBird Code -> Scientific Name)
         df_tax = pd.read_csv(taxonomy_path)
-        self.code_to_meta = df_tax.set_index("SPECIES_CODE")[
-            ["SCI_NAME", "PRIMARY_COM_NAME"]
-        ].to_dict("index")
+        code_col = next(
+            (c for c in df_tax.columns if "SPECIES_CODE" in c.upper()), "SPECIES_CODE"
+        )
+        sci_col = next(
+            (c for c in df_tax.columns if "SCI_NAME" in c.upper()), "SCI_NAME"
+        )
+        com_col = next(
+            (c for c in df_tax.columns if "PRIMARY_COM_NAME" in c.upper()),
+            "PRIMARY_COM_NAME",
+        )
 
-    def _load_and_resample(self, audio_path: str) -> np.ndarray:
-        try:
-            audio, _ = librosa.load(
-                audio_path, sr=self.target_sr, mono=True, res_type="linear"
-            )
-        except Exception as e:
-            print(f"Error loading audio with librosa: {e}")
-            return np.array([], dtype="float32")
-        return audio.astype("float32")
+        self.code_to_meta = df_tax.set_index(code_col)[[sci_col, com_col]].to_dict(
+            "index"
+        )
 
-    def _high_pass_filter(self, audio: np.ndarray, cutoff=200) -> np.ndarray:
-        if len(audio) == 0:
-            return audio
-        sos = scipy.signal.butter(10, cutoff, "hp", fs=self.target_sr, output="sos")
-        filtered = scipy.signal.sosfilt(sos, audio)
-        return filtered.astype("float32")
+    def _prepare_audio(self, audio_path):
+        """
+        Uses AudioPreprocessor to load, filter (optional), and segment audio.
+        """
+        # 1. Load and process using your custom class
+        temp_path = self.processor.create_denoised_temp_file(audio_path)
 
-    def _make_windows(
-        self, waveform: np.ndarray, overlap=OVERLAP
-    ) -> (np.ndarray, list):
-        total_samples = waveform.shape[0]
-        step = int(self.window_samples * (1 - overlap))
+        if not temp_path:
+            return None, None
 
+        import librosa
+
+        # Load the processed temp file
+        audio, _ = librosa.load(temp_path, sr=32000)
+
+        # Pad if audio is too short
+        window_samples = int(32000 * self.window_seconds)
+        if len(audio) < window_samples:
+            padding = window_samples - len(audio)
+            audio = np.pad(audio, (0, padding), "constant")
+
+        # Generate windows (Non-overlapping for Perch default)
+        step = window_samples
         windows = []
         timestamps = []
 
-        if total_samples < self.window_samples:
-            padded = np.zeros(self.window_samples, dtype="float32")
-            padded[:total_samples] = waveform
-            return np.array([padded]), [0.0]
+        for i in range(0, len(audio) - window_samples + 1, step):
+            window = audio[i : i + window_samples]
+            windows.append(window)
+            timestamps.append(i / 32000)
 
-        for start in range(0, total_samples - self.window_samples + 1, step):
-            end = start + self.window_samples
-            windows.append(waveform[start:end])
-            timestamps.append(start / self.target_sr)
+        # Clean up temp file to save space
+        import os
 
-        return np.array(windows, dtype="float32"), timestamps
+        try:
+            os.remove(temp_path)
+        except:
+            pass
 
-    def _suppress_duplicates(self, detections, time_gap_threshold=3.0):
-        if not detections:
+        if len(windows) == 0:
+            return None, None
+
+        return np.stack(windows).astype(np.float32), timestamps
+
+    def analyze(self, audio_path: str, min_conf: float = 0.4, date: datetime = None):
+        # 1. Get sliced data using preprocessor logic
+        wins, t_stamps = self._prepare_audio(audio_path)
+        if wins is None or len(wins) == 0:
             return []
 
-        detections.sort(key=lambda x: x["confidence"], reverse=True)
-        final_detections = []
+        # 2. Convert to Tensor input [batch_size, 160000]
+        tf_wins = tf.convert_to_tensor(wins)
 
-        while detections:
-            best = detections.pop(0)
-            final_detections.append(best)
+        # 3. Inference
+        if "inputs" in self.infer_fn.structured_input_signature[1]:
+            outputs = self.infer_fn(inputs=tf_wins)
+        else:
+            outputs = self.infer_fn(tf_wins)
 
-            # filter out duplicates, if audio events are too close in time, only keep the best one
-            detections = [
-                d
-                for d in detections
-                if not (
-                    d["label"] == best["label"]
-                    and abs(d["start_time"] - best["start_time"]) < time_gap_threshold
-                )
-            ]
+        # 4. Get Logits and convert to probabilities
+        keys = list(outputs.keys())
+        logits = outputs.get("label", outputs.get("output_0", outputs[keys[0]]))
+        probs = tf.math.sigmoid(logits).numpy()
 
-        return sorted(final_detections, key=lambda x: x["start_time"])
+        # 5. Post-processing
+        if len(probs) > 1:
+            probs = scipy.ndimage.uniform_filter1d(
+                probs, size=3, axis=0, mode="nearest"
+            )
 
-    def analyze(self, audio_path: str, date: datetime, threshold: float = THRESHOLD):
-        """
-        Enhanced analysis pipeline
-        """
-        # 1. Load & Resample
-        waveform = self._load_and_resample(audio_path)
-        if len(waveform) == 0:
-            return []
+        # 6. Extract results
+        final_results = []
+        for i in range(len(probs)):
+            for cid in np.where(probs[i] > min_conf)[0]:
+                code = self.id_to_code.get(cid)
+                if not code:
+                    continue
 
-        # 2. Noise Suppression (High Pass)
-        waveform = self._high_pass_filter(waveform)
-
-        # 3. Create Overlapping Windows
-        # overlap=0.5 means each 2.5s will appear in two 5s
-        windows, timestamps = self._make_windows(waveform, overlap=OVERLAP)
-
-        # Batch inference
-        tf_windows = tf.convert_to_tensor(windows, dtype=tf.float32)
-        outputs = self.infer_fn(tf_windows)
-
-        label_logits = outputs["label"]  # Keep as tensor for sigmoid
-
-        probabilities = tf.math.sigmoid(label_logits).numpy()
-
-        # reduce noise by smoothing over time
-        probabilities = scipy.ndimage.uniform_filter1d(
-            probabilities, size=3, axis=0, mode="nearest"
-        )
-
-        raw_detections = []
-        num_windows = probabilities.shape[0]
-
-        for i in range(num_windows):
-            high_prob_indices = np.where(probabilities[i] > threshold)[0]
-
-            start_time = timestamps[i]
-
-            for class_id in high_prob_indices:
-                confidence = float(probabilities[i][class_id])
-                code = self.id_to_code.get(class_id, "Unknown_Code")
                 meta = self.code_to_meta.get(code, {})
+                final_results.append(
+                    {
+                        "start_time": t_stamps[i],
+                        "end_time": t_stamps[i] + self.window_seconds,
+                        "label": code,
+                        "common_name": meta.get("PRIMARY_COM_NAME", code),
+                        "scientific_name": meta.get("SCI_NAME", "Unknown"),
+                        "confidence": float(probs[i][cid]),
+                    }
+                )
 
-                detection = {
-                    "confidence": confidence,
-                    "label": code,
-                    "scientific_name": meta.get("SCI_NAME", "Unknown"),
-                    "common_name": meta.get("PRIMARY_COM_NAME", "Unknown"),
-                    "start_time": start_time,
-                    "end_time": start_time + self.window_seconds,
-                    "date": date.isoformat(),  # 记录日期
-                }
-                raw_detections.append(detection)
-
-        # (NMS) remove duplicates
-        clean_results = self._suppress_duplicates(raw_detections)
-
-        return clean_results
+        final_results.sort(key=lambda x: x["confidence"], reverse=True)
+        return final_results
